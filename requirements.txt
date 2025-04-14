@@ -2,3 +2,9 @@ pydicom
 pynetdicom
 boto3
 python-dotenv
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg
+gdcm
+rich
+pyinstaller

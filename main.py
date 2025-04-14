@@ -38,8 +38,8 @@ class DICOMReceiver:
         self.server_port = server_port
         self.local_ae_title = local_ae_title
         self.ae = AE(ae_title=local_ae_title)
-        self.s3 = self._setup_s3_client()
         self._setup_logging()
+        self.s3 = self._setup_s3_client()
         self._setup_client()
         self.received_studies_dir = Path("received_studies")
         self.received_studies_dir.mkdir(exist_ok=True)
@@ -194,110 +194,68 @@ class DICOMReceiver:
             self.logger.error(traceback.format_exc())
             update_file_upload_status(file_id, None, "failed")
 
-    def _upload_and_cleanup(self, file_path, ds, file_id):
-        """Upload file to S3 and clean up local file."""
-        try:
-            # Run S3 upload in the same thread
-            file_link = self._upload_to_s3_sync(file_path, ds)
-            if file_link:
-                update_file_upload_status(file_id, file_link, "uploaded")
-                # Don't delete local file immediately - let cleanup task handle it
-                self.logger.info(f"[UPLOAD] Successfully uploaded file to S3: {file_path}")
-                return True  # Return success status
-            else:
-                update_file_upload_status(file_id, None, "failed")
-                self.logger.error(f"[ERROR] Failed to upload file to S3: {file_path}")
-                return False  # Return failure status
-        except Exception as e:
-            self.logger.error(f"Error in upload and cleanup: {str(e)}")
-            self.logger.error(traceback.format_exc())
-            update_file_upload_status(file_id, None, "failed")
-            return False  # Return failure status
-
-    def anonymize_dicom(self, file_path):
-        """Anonymize DICOM file by removing sensitive information."""
-        try:
-            ds = pydicom.dcmread(file_path, force=True)
-            # Remove sensitive patient information
-            for tag in ["PatientName", "PatientBirthDate", "PatientSex", "PatientAddress"]:
-                if hasattr(ds, tag):
-                    setattr(ds, tag, "")
-            # Remove all private tags
-            ds.remove_private_tags()
-            # Save to memory buffer
-            output = io.BytesIO()
-            ds.save_as(output, write_like_original=True)
-            output.seek(0)
-            return output
-        except Exception as e:
-            self.logger.error(f"Error anonymizing DICOM file: {str(e)}")
-            self.logger.error(traceback.format_exc())
-            return None
-
-    def _upload_to_s3_sync(self, file_path, ds):
-        """Uploads DICOM file to S3 synchronously."""
+    
+    def _upload_buffer_to_s3(self, buffer, ds):
         bucket_name = os.getenv('AWS_BUCKET_NAME')
         if not bucket_name:
-            self.logger.error("[ERROR] AWS_BUCKET_NAME not found in environment variables")
+            self.logger.error("[ERROR] AWS_BUCKET_NAME not set")
             return None
-            
-        # Create a more detailed S3 path structure
-        file_key = f"dicom/{ds.PatientID}/{ds.StudyInstanceUID}/{ds.SOPInstanceUID}.dcm"
+
+        patient_id = ds.PatientID
+        accession_number = getattr(ds, "AccessionNumber", "unknown")
+        folder_path = f"{patient_id}/{patient_id}_anonymization/{accession_number}{patient_id}/"
+        file_key = f"{folder_path}{ds.SOPInstanceUID}.dcm"
         s3_url = f"s3://{bucket_name}/{file_key}"
 
         try:
-            # Log AWS configuration (without sensitive data)
-            self.logger.info(f"[S3] ====== S3 Upload Details ======")
-            self.logger.info(f"[S3] Bucket: {bucket_name}")
-            self.logger.info(f"[S3] Region: {self.s3.meta.region_name}")
-            self.logger.info(f"[S3] Full S3 Path: {s3_url}")
-            self.logger.info(f"[S3] Local File: {file_path}")
-            
-            # Verify bucket exists
-            try:
-                self.s3.head_bucket(Bucket=bucket_name)
-                self.logger.info(f"[S3] Bucket exists and is accessible")
-            except Exception as e:
-                self.logger.error(f"[ERROR] Bucket verification failed: {str(e)}")
-                return None
-
-            # Upload the file
-            self.logger.info(f"[S3] Starting file upload...")
-            self.s3.upload_file(file_path, bucket_name, file_key)
-            
-            # Verify the upload
-            try:
-                self.s3.head_object(Bucket=bucket_name, Key=file_key)
-                self.logger.info(f"[SUCCESS] File verified in S3: {s3_url}")
-                
-                # Generate a presigned URL for temporary access (optional)
-                presigned_url = self.s3.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': bucket_name, 'Key': file_key},
-                    ExpiresIn=3600  # URL expires in 1 hour
-                )
-                self.logger.info(f"[S3] Generated presigned URL for verification")
-                
-                return s3_url
-            except Exception as e:
-                self.logger.error(f"[ERROR] Upload verification failed: {str(e)}")
-                return None
-            
-        except boto3.exceptions.S3UploadFailedError as e:
-            self.logger.error(f"[ERROR] S3 upload failed (upload error): {str(e)}")
-            self.logger.error(traceback.format_exc())
-            return None
-        except boto3.exceptions.ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            error_message = e.response.get('Error', {}).get('Message', 'No error message')
-            self.logger.error(f"[ERROR] S3 upload failed (client error {error_code}): {error_message}")
-            self.logger.error(traceback.format_exc())
-            return None
+            self.logger.info(f"[S3] Uploading buffer to S3 at {s3_url}")
+            self.s3.upload_fileobj(buffer, bucket_name, file_key)
+            return s3_url
         except Exception as e:
-            self.logger.error(f"[ERROR] S3 upload failed (unexpected error): {str(e)}")
+            self.logger.error(f"[S3 ERROR] Upload failed: {str(e)}")
             self.logger.error(traceback.format_exc())
             return None
 
+    def _upload_and_cleanup(self, file_path, ds, file_id):
+        try:
+            buffer, anon_ds = self.anonymize_dicom(file_path)
+            if buffer and anon_ds:
+                file_link = self._upload_buffer_to_s3(buffer, anon_ds)
+                if file_link:
+                    update_file_upload_status(file_id, file_link, "uploaded")
+                    self.logger.info(f"[UPLOAD] Anonymized file uploaded to S3: {file_link}")
+                    return True
+                else:
+                    update_file_upload_status(file_id, None, "failed")
+                    return False
+            else:
+                update_file_upload_status(file_id, None, "failed")
+                return False
+        except Exception as e:
+            self.logger.error(f"Upload/cleanup error: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            update_file_upload_status(file_id, None, "failed")
+            return False
+
+
+    def anonymize_dicom(self, file_path):
+        try:
+            ds = pydicom.dcmread(file_path, force=True)
+            for tag in ["PatientName", "PatientBirthDate", "PatientSex", "PatientAddress"]:
+                if hasattr(ds, tag):
+                    setattr(ds, tag, "")
+            ds.remove_private_tags()
+
+            output = io.BytesIO()
+            ds.save_as(output, write_like_original=True)
+            output.seek(0)
+            return output, ds
+        except Exception as e:
+            self.logger.error(f"Error anonymizing DICOM file: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return None, None
+
+    
     async def check_study_completions(self):
         """Checks if all study files have been uploaded."""
         while self.running:
@@ -340,6 +298,10 @@ class DICOMReceiver:
                         self.logger.info(f"[INFO] Deleting study with {len(files)} files: {study_folder}")
                         shutil.rmtree(study_folder)
                         self.logger.info(f"[CLEANUP] Deleted old study files: {study_folder}")
+                        patient_folder = study_folder.parent
+                        if not any(patient_folder.iterdir()):
+                            patient_folder.rmdir()
+                            self.logger.info(f"[CLEANUP] Deleted empty patient folder: {patient_folder}")
             except asyncio.CancelledError:
                 self.logger.info("Cleanup task cancelled.")
                 break
@@ -448,7 +410,7 @@ async def main():
         load_dotenv()
         
         # Get server configuration from environment variables with defaults
-        server_ip = os.getenv('DICOM_SERVER_IP', '192.168.10.65')
+        server_ip = os.getenv('DICOM_SERVER_IP', '192.168.10.142')
         server_port = int(os.getenv('DICOM_SERVER_PORT', '11112'))
         local_ae_title = os.getenv('DICOM_AE_TITLE', 'STREAMSCP')
         
